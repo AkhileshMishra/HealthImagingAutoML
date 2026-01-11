@@ -143,7 +143,10 @@ jobs:
 
       - name: Install Python dependencies
         working-directory: MLOps-Pipeline
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install "sagemaker[local]>=2.232.0" --upgrade
+          python -c "import sagemaker; print(f'SageMaker version: {sagemaker.__version__}')"
 
       - name: CDK Bootstrap
         working-directory: MLOps-Pipeline
@@ -171,8 +174,8 @@ jobs:
       - name: Create SageMaker Pipeline
         working-directory: MLOps-Pipeline
         run: |
-          # Install sagemaker SDK explicitly
-          pip install "sagemaker>=2.232.0"
+          # Verify sagemaker is installed
+          python -c "from sagemaker.processing import Processor; print('SageMaker processing module OK')"
           
           # Get values from CDK outputs
           PIPELINE_NAME=$(cat outputs.json | jq -r '.[].PipelineName // empty')
