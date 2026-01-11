@@ -171,6 +171,9 @@ jobs:
       - name: Create SageMaker Pipeline
         working-directory: MLOps-Pipeline
         run: |
+          # Install sagemaker SDK explicitly
+          pip install "sagemaker>=2.232.0"
+          
           # Get values from CDK outputs
           PIPELINE_NAME=$(cat outputs.json | jq -r '.[].PipelineName // empty')
           SAGEMAKER_BUCKET=$(cat outputs.json | jq -r '.[].SageMakerBucketName // empty')
@@ -178,6 +181,11 @@ jobs:
           SAGEMAKER_ROLE=$(cat outputs.json | jq -r '.[].SageMakerRoleArn // empty')
           
           echo "Creating SageMaker Pipeline..."
+          echo "Pipeline: ${PIPELINE_NAME}"
+          echo "Bucket: ${SAGEMAKER_BUCKET}"
+          echo "Image: ${FETCHER_IMAGE}"
+          echo "Role: ${SAGEMAKER_ROLE}"
+          
           python << EOF
           from pipeline.pipeline_definition import get_pipeline
           
