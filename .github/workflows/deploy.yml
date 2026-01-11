@@ -1,0 +1,314 @@
+name: Deploy HealthImaging MLOps Platform
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-tlm-proxy:
+    name: Deploy TLM Proxy
+    runs-on: ubuntu-latest
+    outputs:
+      alb-url: ${{ steps.deploy.outputs.alb-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::637423443220:role/HealthImagingAutoML-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tile-level-marker-proxy/package-lock.json
+
+      - name: Install dependencies
+        working-directory: tile-level-marker-proxy
+        run: npm ci
+
+      - name: CDK Bootstrap
+        working-directory: tile-level-marker-proxy
+        run: npx cdk bootstrap --require-approval never || true
+
+      - name: Deploy TLM Proxy
+        id: deploy
+        working-directory: tile-level-marker-proxy
+        run: |
+          npx cdk deploy --require-approval never --outputs-file outputs.json 2>&1 | tee deploy.log
+          if [ -f outputs.json ]; then
+            ALB_URL=$(cat outputs.json | jq -r '.[].LoadBalancerDNS // empty' | head -1)
+            echo "alb-url=${ALB_URL}" >> $GITHUB_OUTPUT
+            echo "### TLM Proxy Deployed :rocket:" >> $GITHUB_STEP_SUMMARY
+            echo "ALB URL: \`${ALB_URL}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  deploy-s3-storescp:
+    name: Deploy S3 StoreSCP
+    runs-on: ubuntu-latest
+    outputs:
+      nlb-dns: ${{ steps.deploy.outputs.nlb-dns }}
+      bucket-name: ${{ steps.deploy.outputs.bucket-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::637423443220:role/HealthImagingAutoML-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: s3-storescp/requirements.txt
+
+      - name: Setup Node.js (for CDK)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK
+        run: npm install -g aws-cdk
+
+      - name: Install Python dependencies
+        working-directory: s3-storescp
+        run: pip install -r requirements.txt
+
+      - name: CDK Bootstrap
+        working-directory: s3-storescp
+        run: cdk bootstrap --require-approval never || true
+
+      - name: Deploy S3 StoreSCP
+        id: deploy
+        working-directory: s3-storescp
+        run: |
+          cdk deploy --require-approval never --outputs-file outputs.json 2>&1 | tee deploy.log
+          if [ -f outputs.json ]; then
+            cat outputs.json
+            echo "### S3 StoreSCP Deployed :rocket:" >> $GITHUB_STEP_SUMMARY
+          fi
+          # Extract NLB DNS from CloudFormation
+          NLB_DNS=$(aws cloudformation describe-stacks --stack-name S3SCP --query "Stacks[0].Outputs[?contains(OutputKey,'NLB') || contains(OutputKey,'LoadBalancer')].OutputValue" --output text 2>/dev/null || echo "")
+          BUCKET=$(aws cloudformation describe-stacks --stack-name S3SCP --query "Stacks[0].Outputs[?contains(OutputKey,'Bucket')].OutputValue" --output text 2>/dev/null || echo "")
+          echo "nlb-dns=${NLB_DNS}" >> $GITHUB_OUTPUT
+          echo "bucket-name=${BUCKET}" >> $GITHUB_OUTPUT
+          echo "NLB DNS: \`${NLB_DNS}\`" >> $GITHUB_STEP_SUMMARY
+          echo "S3 Bucket: \`${BUCKET}\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy-mlops-pipeline:
+    name: Deploy MLOps Pipeline
+    runs-on: ubuntu-latest
+    outputs:
+      pipeline-name: ${{ steps.deploy.outputs.pipeline-name }}
+      sagemaker-bucket: ${{ steps.deploy.outputs.sagemaker-bucket }}
+      fetcher-image: ${{ steps.deploy.outputs.fetcher-image }}
+      sagemaker-role: ${{ steps.deploy.outputs.sagemaker-role }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::637423443220:role/HealthImagingAutoML-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: MLOps-Pipeline/requirements.txt
+
+      - name: Setup Node.js (for CDK)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CDK
+        run: npm install -g aws-cdk
+
+      - name: Install Python dependencies
+        working-directory: MLOps-Pipeline
+        run: pip install -r requirements.txt
+
+      - name: CDK Bootstrap
+        working-directory: MLOps-Pipeline
+        run: cdk bootstrap --require-approval never || true
+
+      - name: Deploy MLOps Pipeline Stack
+        id: deploy
+        working-directory: MLOps-Pipeline
+        run: |
+          cdk deploy --require-approval never --outputs-file outputs.json 2>&1 | tee deploy.log
+          
+          # Parse outputs
+          if [ -f outputs.json ]; then
+            PIPELINE_NAME=$(cat outputs.json | jq -r '.[].PipelineName // empty')
+            SAGEMAKER_BUCKET=$(cat outputs.json | jq -r '.[].SageMakerBucketName // empty')
+            FETCHER_IMAGE=$(cat outputs.json | jq -r '.[].FetcherImageUri // empty')
+            SAGEMAKER_ROLE=$(cat outputs.json | jq -r '.[].SageMakerRoleArn // empty')
+            
+            echo "pipeline-name=${PIPELINE_NAME}" >> $GITHUB_OUTPUT
+            echo "sagemaker-bucket=${SAGEMAKER_BUCKET}" >> $GITHUB_OUTPUT
+            echo "fetcher-image=${FETCHER_IMAGE}" >> $GITHUB_OUTPUT
+            echo "sagemaker-role=${SAGEMAKER_ROLE}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create SageMaker Pipeline
+        working-directory: MLOps-Pipeline
+        run: |
+          # Get values from CDK outputs
+          PIPELINE_NAME=$(cat outputs.json | jq -r '.[].PipelineName // empty')
+          SAGEMAKER_BUCKET=$(cat outputs.json | jq -r '.[].SageMakerBucketName // empty')
+          FETCHER_IMAGE=$(cat outputs.json | jq -r '.[].FetcherImageUri // empty')
+          SAGEMAKER_ROLE=$(cat outputs.json | jq -r '.[].SageMakerRoleArn // empty')
+          
+          echo "Creating SageMaker Pipeline..."
+          python << EOF
+          from pipeline.pipeline_definition import get_pipeline
+          
+          pipeline = get_pipeline(
+              role='${SAGEMAKER_ROLE}',
+              pipeline_name='${PIPELINE_NAME}',
+              fetcher_image_uri='${FETCHER_IMAGE}',
+              default_bucket='${SAGEMAKER_BUCKET}',
+              region='${{ env.AWS_REGION }}',
+          )
+          pipeline.upsert(role_arn='${SAGEMAKER_ROLE}')
+          print('SageMaker Pipeline created/updated successfully!')
+          EOF
+
+      - name: Output Summary
+        run: |
+          echo "### MLOps Pipeline Deployed :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "Pipeline Name: \`${{ steps.deploy.outputs.pipeline-name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "SageMaker Bucket: \`${{ steps.deploy.outputs.sagemaker-bucket }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Fetcher Image: \`${{ steps.deploy.outputs.fetcher-image }}\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy-viewer:
+    name: Deploy Imaging Viewer
+    runs-on: ubuntu-latest
+    needs: [deploy-tlm-proxy]
+    outputs:
+      viewer-url: ${{ steps.deploy.outputs.viewer-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::637423443220:role/HealthImagingAutoML-GitHubActions-Role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: imaging-viewer-ui/package-lock.json
+
+      - name: Install Amplify CLI
+        run: npm install -g @aws-amplify/cli
+
+      - name: Install dependencies
+        working-directory: imaging-viewer-ui
+        run: npm ci
+
+      - name: Build Viewer
+        working-directory: imaging-viewer-ui
+        run: npm run build
+        env:
+          CI: false
+
+      - name: Deploy to S3/CloudFront
+        id: deploy
+        working-directory: imaging-viewer-ui
+        run: |
+          # Create S3 bucket for hosting if not exists
+          BUCKET_NAME="healthimaging-viewer-${GITHUB_SHA:0:8}"
+          aws s3 mb s3://${BUCKET_NAME} --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          # Configure bucket for static website hosting
+          aws s3 website s3://${BUCKET_NAME} --index-document index.html --error-document index.html
+          
+          # Upload build files
+          aws s3 sync build/ s3://${BUCKET_NAME}/ --delete
+          
+          # Make bucket public (for demo purposes)
+          aws s3api put-bucket-policy --bucket ${BUCKET_NAME} --policy '{
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Sid": "PublicReadGetObject",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::'${BUCKET_NAME}'/*"
+            }]
+          }' 2>/dev/null || true
+          
+          # Disable block public access
+          aws s3api put-public-access-block --bucket ${BUCKET_NAME} --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false" 2>/dev/null || true
+          
+          VIEWER_URL="http://${BUCKET_NAME}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
+          echo "viewer-url=${VIEWER_URL}" >> $GITHUB_OUTPUT
+          
+          echo "### Viewer Deployed :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "Viewer URL: ${VIEWER_URL}" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-tlm-proxy, deploy-s3-storescp, deploy-mlops-pipeline, deploy-viewer]
+    if: always()
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "# 🏥 HealthImaging MLOps Platform - Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📍 Endpoints & Resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Frontend" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Imaging Viewer | ${{ needs.deploy-viewer.outputs.viewer-url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backend Services" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Endpoint |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| TLM Proxy (ALB) | \`${{ needs.deploy-tlm-proxy.outputs.alb-url }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 StoreSCP (NLB) | \`${{ needs.deploy-s3-storescp.outputs.nlb-dns }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| DICOM Receive Bucket | \`${{ needs.deploy-s3-storescp.outputs.bucket-name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### MLOps Pipeline" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Pipeline Name | \`${{ needs.deploy-mlops-pipeline.outputs.pipeline-name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SageMaker Bucket | \`${{ needs.deploy-mlops-pipeline.outputs.sagemaker-bucket }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🧪 Testing Commands" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test SageMaker Pipeline" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "aws sagemaker start-pipeline-execution \\" >> $GITHUB_STEP_SUMMARY
+          echo "    --pipeline-name ${{ needs.deploy-mlops-pipeline.outputs.pipeline-name }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "    --pipeline-parameters '[{\"Name\":\"ImageSetId\",\"Value\":\"YOUR_IMAGESET_ID\"},{\"Name\":\"DatastoreId\",\"Value\":\"YOUR_DATASTORE_ID\"}]'" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Send DICOM to StoreSCP" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "storescu -c S3SCP@${{ needs.deploy-s3-storescp.outputs.nlb-dns }}:11113 --tls /path/to/dicom/" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
