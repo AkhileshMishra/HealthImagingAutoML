@@ -205,6 +205,8 @@ jobs:
     needs: [deploy-tlm-proxy]
     outputs:
       viewer-url: ${{ steps.deploy.outputs.viewer-url }}
+      cognito-user-pool-id: ${{ steps.cognito.outputs.user-pool-id }}
+      cognito-client-id: ${{ steps.cognito.outputs.client-id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -221,8 +223,84 @@ jobs:
           cache: 'npm'
           cache-dependency-path: imaging-viewer-ui/package-lock.json
 
-      - name: Install Amplify CLI
-        run: npm install -g @aws-amplify/cli
+      - name: Create Cognito User Pool
+        id: cognito
+        run: |
+          # Check if user pool already exists
+          EXISTING_POOL=$(aws cognito-idp list-user-pools --max-results 60 --query "UserPools[?Name=='HealthImagingViewerPool'].Id" --output text)
+          
+          if [ -n "$EXISTING_POOL" ] && [ "$EXISTING_POOL" != "None" ]; then
+            USER_POOL_ID=$EXISTING_POOL
+            echo "Using existing Cognito User Pool: $USER_POOL_ID"
+          else
+            # Create new user pool
+            USER_POOL_ID=$(aws cognito-idp create-user-pool \
+              --pool-name HealthImagingViewerPool \
+              --auto-verified-attributes email \
+              --username-attributes email \
+              --policies '{"PasswordPolicy":{"MinimumLength":8,"RequireUppercase":true,"RequireLowercase":true,"RequireNumbers":true,"RequireSymbols":false}}' \
+              --query 'UserPool.Id' --output text)
+            echo "Created Cognito User Pool: $USER_POOL_ID"
+          fi
+          
+          # Check if client exists
+          EXISTING_CLIENT=$(aws cognito-idp list-user-pool-clients --user-pool-id $USER_POOL_ID --query "UserPoolClients[?ClientName=='HealthImagingViewerClient'].ClientId" --output text)
+          
+          if [ -n "$EXISTING_CLIENT" ] && [ "$EXISTING_CLIENT" != "None" ]; then
+            CLIENT_ID=$EXISTING_CLIENT
+            echo "Using existing Cognito Client: $CLIENT_ID"
+          else
+            # Create app client
+            CLIENT_ID=$(aws cognito-idp create-user-pool-client \
+              --user-pool-id $USER_POOL_ID \
+              --client-name HealthImagingViewerClient \
+              --no-generate-secret \
+              --explicit-auth-flows ALLOW_USER_SRP_AUTH ALLOW_REFRESH_TOKEN_AUTH \
+              --query 'UserPoolClient.ClientId' --output text)
+            echo "Created Cognito Client: $CLIENT_ID"
+          fi
+          
+          # Create identity pool if not exists
+          EXISTING_IDENTITY_POOL=$(aws cognito-identity list-identity-pools --max-results 60 --query "IdentityPools[?IdentityPoolName=='HealthImagingViewerIdentityPool'].IdentityPoolId" --output text)
+          
+          if [ -n "$EXISTING_IDENTITY_POOL" ] && [ "$EXISTING_IDENTITY_POOL" != "None" ]; then
+            IDENTITY_POOL_ID=$EXISTING_IDENTITY_POOL
+          else
+            IDENTITY_POOL_ID=$(aws cognito-identity create-identity-pool \
+              --identity-pool-name HealthImagingViewerIdentityPool \
+              --allow-unauthenticated-identities \
+              --cognito-identity-providers ProviderName=cognito-idp.${{ env.AWS_REGION }}.amazonaws.com/${USER_POOL_ID},ClientId=${CLIENT_ID} \
+              --query 'IdentityPoolId' --output text)
+          fi
+          
+          echo "user-pool-id=${USER_POOL_ID}" >> $GITHUB_OUTPUT
+          echo "client-id=${CLIENT_ID}" >> $GITHUB_OUTPUT
+          echo "identity-pool-id=${IDENTITY_POOL_ID}" >> $GITHUB_OUTPUT
+
+      - name: Generate aws-exports.js
+        run: |
+          cat > imaging-viewer-ui/src/aws-exports.js << EOF
+          /* eslint-disable */
+          const awsExports = {
+              "aws_project_region": "${{ env.AWS_REGION }}",
+              "aws_cognito_region": "${{ env.AWS_REGION }}",
+              "aws_user_pools_id": "${{ steps.cognito.outputs.user-pool-id }}",
+              "aws_user_pools_web_client_id": "${{ steps.cognito.outputs.client-id }}",
+              "aws_cognito_identity_pool_id": "${{ steps.cognito.outputs.identity-pool-id }}",
+              "oauth": {},
+              "aws_cognito_username_attributes": ["EMAIL"],
+              "aws_cognito_social_providers": [],
+              "aws_cognito_signup_attributes": ["EMAIL"],
+              "aws_cognito_mfa_configuration": "OFF",
+              "aws_cognito_mfa_types": ["SMS"],
+              "aws_cognito_password_protection_settings": {
+                  "passwordPolicyMinLength": 8,
+                  "passwordPolicyCharacters": []
+              },
+              "aws_cognito_verification_mechanisms": ["EMAIL"]
+          };
+          export default awsExports;
+          EOF
 
       - name: Install dependencies
         working-directory: imaging-viewer-ui
@@ -238,9 +316,14 @@ jobs:
         id: deploy
         working-directory: imaging-viewer-ui
         run: |
-          # Create S3 bucket for hosting if not exists
-          BUCKET_NAME="healthimaging-viewer-${GITHUB_SHA:0:8}"
+          # Use consistent bucket name
+          BUCKET_NAME="healthimaging-viewer-ui-637423443220"
+          
+          # Create bucket if not exists
           aws s3 mb s3://${BUCKET_NAME} --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          # Disable block public access first
+          aws s3api put-public-access-block --bucket ${BUCKET_NAME} --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false" 2>/dev/null || true
           
           # Configure bucket for static website hosting
           aws s3 website s3://${BUCKET_NAME} --index-document index.html --error-document index.html
@@ -248,7 +331,7 @@ jobs:
           # Upload build files
           aws s3 sync build/ s3://${BUCKET_NAME}/ --delete
           
-          # Make bucket public (for demo purposes)
+          # Make bucket public
           aws s3api put-bucket-policy --bucket ${BUCKET_NAME} --policy '{
             "Version": "2012-10-17",
             "Statement": [{
@@ -258,16 +341,14 @@ jobs:
               "Action": "s3:GetObject",
               "Resource": "arn:aws:s3:::'${BUCKET_NAME}'/*"
             }]
-          }' 2>/dev/null || true
-          
-          # Disable block public access
-          aws s3api put-public-access-block --bucket ${BUCKET_NAME} --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false" 2>/dev/null || true
+          }'
           
           VIEWER_URL="http://${BUCKET_NAME}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
           echo "viewer-url=${VIEWER_URL}" >> $GITHUB_OUTPUT
           
           echo "### Viewer Deployed :rocket:" >> $GITHUB_STEP_SUMMARY
           echo "Viewer URL: ${VIEWER_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "Cognito User Pool: ${{ steps.cognito.outputs.user-pool-id }}" >> $GITHUB_STEP_SUMMARY
 
   summary:
     name: Deployment Summary
