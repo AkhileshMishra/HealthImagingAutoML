@@ -330,8 +330,14 @@ jobs:
           # Create bucket if not exists
           aws s3 mb s3://${BUCKET_NAME} --region ${{ env.AWS_REGION }} 2>/dev/null || true
           
-          # Disable block public access first
-          aws s3api put-public-access-block --bucket ${BUCKET_NAME} --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false" 2>/dev/null || true
+          # Wait for bucket to be available
+          sleep 2
+          
+          # Disable block public access FIRST (required before public policy)
+          aws s3api delete-public-access-block --bucket ${BUCKET_NAME} 2>/dev/null || true
+          
+          # Wait for settings to propagate
+          sleep 3
           
           # Configure bucket for static website hosting
           aws s3 website s3://${BUCKET_NAME} --index-document index.html --error-document index.html
@@ -339,17 +345,19 @@ jobs:
           # Upload build files
           aws s3 sync build/ s3://${BUCKET_NAME}/ --delete
           
-          # Make bucket public
-          aws s3api put-bucket-policy --bucket ${BUCKET_NAME} --policy '{
-            "Version": "2012-10-17",
-            "Statement": [{
-              "Sid": "PublicReadGetObject",
-              "Effect": "Allow",
-              "Principal": "*",
-              "Action": "s3:GetObject",
-              "Resource": "arn:aws:s3:::'${BUCKET_NAME}'/*"
-            }]
-          }'
+          # Make bucket public (retry if needed)
+          for i in 1 2 3; do
+            aws s3api put-bucket-policy --bucket ${BUCKET_NAME} --policy '{
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Sid": "PublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::'${BUCKET_NAME}'/*"
+              }]
+            }' && break || sleep 5
+          done
           
           VIEWER_URL="http://${BUCKET_NAME}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
           echo "viewer-url=${VIEWER_URL}" >> $GITHUB_OUTPUT
