@@ -372,7 +372,7 @@ jobs:
           aws s3 sync build/ s3://${BUCKET_NAME}/ --delete
           
           # Check if CloudFront distribution exists
-          EXISTING_DIST=$(aws cloudfront list-distributions --query "DistributionList.Items[?Origins.Items[0].DomainName=='${BUCKET_NAME}.s3.amazonaws.com'].Id" --output text 2>/dev/null || echo "")
+          EXISTING_DIST=$(aws cloudfront list-distributions --query "DistributionList.Items[?Origins.Items[0].DomainName=='${BUCKET_NAME}.s3.${{ env.AWS_REGION }}.amazonaws.com'].Id" --output text 2>/dev/null || echo "")
           
           if [ -n "$EXISTING_DIST" ] && [ "$EXISTING_DIST" != "None" ]; then
             DIST_ID=$EXISTING_DIST
