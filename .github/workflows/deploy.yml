@@ -145,8 +145,8 @@ jobs:
         working-directory: MLOps-Pipeline
         run: |
           pip install -r requirements.txt
-          pip install "sagemaker[local]>=2.232.0" --upgrade
-          python -c "import sagemaker; print(f'SageMaker version: {sagemaker.__version__}')"
+          pip install "sagemaker>=2.232.0" --upgrade --force-reinstall
+          python -c "from sagemaker.processing import Processor; print('SageMaker SDK installed successfully')"
 
       - name: CDK Bootstrap
         working-directory: MLOps-Pipeline
