@@ -359,50 +359,105 @@ jobs:
         env:
           CI: false
 
-      - name: Deploy to S3/CloudFront
+      - name: Deploy to CloudFront
         id: deploy
         working-directory: imaging-viewer-ui
         run: |
-          # Use consistent bucket name
           BUCKET_NAME="healthimaging-viewer-ui-637423443220"
           
           # Create bucket if not exists
           aws s3 mb s3://${BUCKET_NAME} --region ${{ env.AWS_REGION }} 2>/dev/null || true
           
-          # Wait for bucket to be available
-          sleep 2
-          
-          # Disable block public access FIRST (required before public policy)
-          aws s3api delete-public-access-block --bucket ${BUCKET_NAME} 2>/dev/null || true
-          
-          # Wait for settings to propagate
-          sleep 3
-          
-          # Configure bucket for static website hosting
-          aws s3 website s3://${BUCKET_NAME} --index-document index.html --error-document index.html
-          
           # Upload build files
           aws s3 sync build/ s3://${BUCKET_NAME}/ --delete
           
-          # Make bucket public (retry if needed)
-          for i in 1 2 3; do
+          # Check if CloudFront distribution exists
+          EXISTING_DIST=$(aws cloudfront list-distributions --query "DistributionList.Items[?Origins.Items[0].DomainName=='${BUCKET_NAME}.s3.amazonaws.com'].Id" --output text 2>/dev/null || echo "")
+          
+          if [ -n "$EXISTING_DIST" ] && [ "$EXISTING_DIST" != "None" ]; then
+            DIST_ID=$EXISTING_DIST
+            VIEWER_URL=$(aws cloudfront get-distribution --id $DIST_ID --query "Distribution.DomainName" --output text)
+            echo "Using existing CloudFront distribution: $DIST_ID"
+          else
+            # Create OAC for CloudFront to access S3
+            OAC_ID=$(aws cloudfront list-origin-access-controls --query "OriginAccessControlList.Items[?Name=='HealthImagingViewerOAC'].Id" --output text 2>/dev/null || echo "")
+            
+            if [ -z "$OAC_ID" ] || [ "$OAC_ID" == "None" ]; then
+              OAC_ID=$(aws cloudfront create-origin-access-control --origin-access-control-config '{
+                "Name": "HealthImagingViewerOAC",
+                "SigningProtocol": "sigv4",
+                "SigningBehavior": "always",
+                "OriginAccessControlOriginType": "s3"
+              }' --query "OriginAccessControl.Id" --output text)
+            fi
+            
+            # Create CloudFront distribution
+            DIST_CONFIG=$(cat << EOF
+          {
+            "CallerReference": "healthimaging-viewer-$(date +%s)",
+            "Origins": {
+              "Quantity": 1,
+              "Items": [{
+                "Id": "S3Origin",
+                "DomainName": "${BUCKET_NAME}.s3.${{ env.AWS_REGION }}.amazonaws.com",
+                "S3OriginConfig": {"OriginAccessIdentity": ""},
+                "OriginAccessControlId": "${OAC_ID}"
+              }]
+            },
+            "DefaultCacheBehavior": {
+              "TargetOriginId": "S3Origin",
+              "ViewerProtocolPolicy": "redirect-to-https",
+              "AllowedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]},
+              "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]},
+              "ForwardedValues": {"QueryString": false, "Cookies": {"Forward": "none"}},
+              "MinTTL": 0,
+              "DefaultTTL": 86400,
+              "MaxTTL": 31536000,
+              "Compress": true
+            },
+            "DefaultRootObject": "index.html",
+            "CustomErrorResponses": {
+              "Quantity": 1,
+              "Items": [{
+                "ErrorCode": 403,
+                "ResponsePagePath": "/index.html",
+                "ResponseCode": "200",
+                "ErrorCachingMinTTL": 300
+              }]
+            },
+            "Comment": "HealthImaging Viewer UI",
+            "Enabled": true
+          }
+          EOF
+          )
+            
+            DIST_RESULT=$(aws cloudfront create-distribution --distribution-config "$DIST_CONFIG")
+            DIST_ID=$(echo $DIST_RESULT | jq -r '.Distribution.Id')
+            VIEWER_URL=$(echo $DIST_RESULT | jq -r '.Distribution.DomainName')
+            
+            # Update S3 bucket policy to allow CloudFront OAC
             aws s3api put-bucket-policy --bucket ${BUCKET_NAME} --policy '{
               "Version": "2012-10-17",
               "Statement": [{
-                "Sid": "PublicReadGetObject",
+                "Sid": "AllowCloudFrontServicePrincipal",
                 "Effect": "Allow",
-                "Principal": "*",
+                "Principal": {"Service": "cloudfront.amazonaws.com"},
                 "Action": "s3:GetObject",
-                "Resource": "arn:aws:s3:::'${BUCKET_NAME}'/*"
+                "Resource": "arn:aws:s3:::'${BUCKET_NAME}'/*",
+                "Condition": {
+                  "StringEquals": {
+                    "AWS:SourceArn": "arn:aws:cloudfront::637423443220:distribution/'${DIST_ID}'"
+                  }
+                }
               }]
-            }' && break || sleep 5
-          done
+            }'
+          fi
           
-          VIEWER_URL="http://${BUCKET_NAME}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
-          echo "viewer-url=${VIEWER_URL}" >> $GITHUB_OUTPUT
+          echo "viewer-url=https://${VIEWER_URL}" >> $GITHUB_OUTPUT
           
           echo "### Viewer Deployed :rocket:" >> $GITHUB_STEP_SUMMARY
-          echo "Viewer URL: ${VIEWER_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "Viewer URL: https://${VIEWER_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "CloudFront Distribution: ${DIST_ID}" >> $GITHUB_STEP_SUMMARY
           echo "Cognito User Pool: ${{ steps.cognito.outputs.user-pool-id }}" >> $GITHUB_STEP_SUMMARY
 
   summary:
