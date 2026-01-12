@@ -144,10 +144,14 @@ jobs:
       - name: Install Python dependencies
         working-directory: MLOps-Pipeline
         run: |
+          # Install CDK deps
           pip install aws-cdk-lib constructs boto3
-          pip install --no-deps sagemaker
-          pip install sagemaker-core schema packaging attrs platformdirs cloudpickle jsonschema tblib psutil docker pyyaml
-          python -c "from sagemaker.processing import Processor; print('SageMaker SDK ready')"
+          
+          # Install sagemaker with minimal deps (exclude torch, tensorflow)
+          pip install "sagemaker>=2.200.0,<2.230.0"
+          
+          # Verify
+          python -c "from sagemaker.processing import Processor; from sagemaker.workflow.pipeline import Pipeline; print('SageMaker SDK ready')"
 
       - name: CDK Bootstrap
         working-directory: MLOps-Pipeline
