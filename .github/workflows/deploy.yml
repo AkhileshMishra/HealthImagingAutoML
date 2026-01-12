@@ -161,19 +161,28 @@ jobs:
         id: deploy
         working-directory: MLOps-Pipeline
         run: |
-          cdk deploy --require-approval never --outputs-file outputs.json 2>&1 | tee deploy.log
+          cdk deploy --require-approval never --outputs-file cdk-outputs.json 2>&1 | tee deploy.log
+          
+          # Debug: show outputs file
+          echo "=== CDK Outputs ==="
+          cat cdk-outputs.json || echo "No outputs file found"
           
           # Parse outputs
-          if [ -f outputs.json ]; then
-            PIPELINE_NAME=$(cat outputs.json | jq -r '.[].PipelineName // empty')
-            SAGEMAKER_BUCKET=$(cat outputs.json | jq -r '.[].SageMakerBucketName // empty')
-            FETCHER_IMAGE=$(cat outputs.json | jq -r '.[].FetcherImageUri // empty')
-            SAGEMAKER_ROLE=$(cat outputs.json | jq -r '.[].SageMakerRoleArn // empty')
+          if [ -f cdk-outputs.json ]; then
+            PIPELINE_NAME=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.PipelineName // empty')
+            SAGEMAKER_BUCKET=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.SageMakerBucketName // empty')
+            FETCHER_IMAGE=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.FetcherImageUri // empty')
+            SAGEMAKER_ROLE=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.SageMakerRoleArn // empty')
             
             echo "pipeline-name=${PIPELINE_NAME}" >> $GITHUB_OUTPUT
             echo "sagemaker-bucket=${SAGEMAKER_BUCKET}" >> $GITHUB_OUTPUT
             echo "fetcher-image=${FETCHER_IMAGE}" >> $GITHUB_OUTPUT
             echo "sagemaker-role=${SAGEMAKER_ROLE}" >> $GITHUB_OUTPUT
+            
+            echo "Pipeline: ${PIPELINE_NAME}"
+            echo "Bucket: ${SAGEMAKER_BUCKET}"
+            echo "Image: ${FETCHER_IMAGE}"
+            echo "Role: ${SAGEMAKER_ROLE}"
           fi
 
       - name: Create SageMaker Pipeline
@@ -182,17 +191,22 @@ jobs:
           # Verify sagemaker is installed
           python -c "from sagemaker.processing import Processor; print('SageMaker processing module OK')"
           
-          # Get values from CDK outputs
-          PIPELINE_NAME=$(cat outputs.json | jq -r '.[].PipelineName // empty')
-          SAGEMAKER_BUCKET=$(cat outputs.json | jq -r '.[].SageMakerBucketName // empty')
-          FETCHER_IMAGE=$(cat outputs.json | jq -r '.[].FetcherImageUri // empty')
-          SAGEMAKER_ROLE=$(cat outputs.json | jq -r '.[].SageMakerRoleArn // empty')
+          # Get values from step outputs
+          PIPELINE_NAME="${{ steps.deploy.outputs.pipeline-name }}"
+          SAGEMAKER_BUCKET="${{ steps.deploy.outputs.sagemaker-bucket }}"
+          FETCHER_IMAGE="${{ steps.deploy.outputs.fetcher-image }}"
+          SAGEMAKER_ROLE="${{ steps.deploy.outputs.sagemaker-role }}"
           
           echo "Creating SageMaker Pipeline..."
           echo "Pipeline: ${PIPELINE_NAME}"
           echo "Bucket: ${SAGEMAKER_BUCKET}"
           echo "Image: ${FETCHER_IMAGE}"
           echo "Role: ${SAGEMAKER_ROLE}"
+          
+          if [ -z "$SAGEMAKER_ROLE" ]; then
+            echo "ERROR: SageMaker role not found in CDK outputs"
+            exit 1
+          fi
           
           python << EOF
           from pipeline.pipeline_definition import get_pipeline
