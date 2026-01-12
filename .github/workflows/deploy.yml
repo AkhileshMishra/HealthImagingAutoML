@@ -161,42 +161,44 @@ jobs:
         id: deploy
         working-directory: MLOps-Pipeline
         run: |
-          cdk deploy --require-approval never --outputs-file cdk-outputs.json 2>&1 | tee deploy.log
+          set -e
           
-          # Debug: show outputs file
+          echo "=== Starting CDK Deploy ==="
+          cdk deploy --require-approval never --outputs-file cdk-outputs.json
+          
+          echo "=== CDK Deploy Complete ==="
           echo "=== CDK Outputs ==="
-          cat cdk-outputs.json || echo "No outputs file found"
+          cat cdk-outputs.json
           
-          # Parse outputs
-          if [ -f cdk-outputs.json ]; then
-            PIPELINE_NAME=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.PipelineName // empty')
-            SAGEMAKER_BUCKET=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.SageMakerBucketName // empty')
-            FETCHER_IMAGE=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.FetcherImageUri // empty')
-            SAGEMAKER_ROLE=$(cat cdk-outputs.json | jq -r 'to_entries[0].value.SageMakerRoleArn // empty')
-            
-            echo "pipeline-name=${PIPELINE_NAME}" >> $GITHUB_OUTPUT
-            echo "sagemaker-bucket=${SAGEMAKER_BUCKET}" >> $GITHUB_OUTPUT
-            echo "fetcher-image=${FETCHER_IMAGE}" >> $GITHUB_OUTPUT
-            echo "sagemaker-role=${SAGEMAKER_ROLE}" >> $GITHUB_OUTPUT
-            
-            echo "Pipeline: ${PIPELINE_NAME}"
-            echo "Bucket: ${SAGEMAKER_BUCKET}"
-            echo "Image: ${FETCHER_IMAGE}"
-            echo "Role: ${SAGEMAKER_ROLE}"
-          fi
+          # Parse outputs - handle the nested structure
+          STACK_NAME=$(cat cdk-outputs.json | jq -r 'keys[0]')
+          echo "Stack name: ${STACK_NAME}"
+          
+          PIPELINE_NAME=$(cat cdk-outputs.json | jq -r ".\"${STACK_NAME}\".PipelineName // empty")
+          SAGEMAKER_BUCKET=$(cat cdk-outputs.json | jq -r ".\"${STACK_NAME}\".SageMakerBucketName // empty")
+          FETCHER_IMAGE=$(cat cdk-outputs.json | jq -r ".\"${STACK_NAME}\".FetcherImageUri // empty")
+          SAGEMAKER_ROLE=$(cat cdk-outputs.json | jq -r ".\"${STACK_NAME}\".SageMakerRoleArn // empty")
+          
+          echo "Parsed values:"
+          echo "  Pipeline: ${PIPELINE_NAME}"
+          echo "  Bucket: ${SAGEMAKER_BUCKET}"
+          echo "  Image: ${FETCHER_IMAGE}"
+          echo "  Role: ${SAGEMAKER_ROLE}"
+          
+          # Save to outputs
+          echo "pipeline-name=${PIPELINE_NAME}" >> $GITHUB_OUTPUT
+          echo "sagemaker-bucket=${SAGEMAKER_BUCKET}" >> $GITHUB_OUTPUT
+          echo "fetcher-image=${FETCHER_IMAGE}" >> $GITHUB_OUTPUT
+          echo "sagemaker-role=${SAGEMAKER_ROLE}" >> $GITHUB_OUTPUT
 
       - name: Create SageMaker Pipeline
         working-directory: MLOps-Pipeline
+        env:
+          PIPELINE_NAME: ${{ steps.deploy.outputs.pipeline-name }}
+          SAGEMAKER_BUCKET: ${{ steps.deploy.outputs.sagemaker-bucket }}
+          FETCHER_IMAGE: ${{ steps.deploy.outputs.fetcher-image }}
+          SAGEMAKER_ROLE: ${{ steps.deploy.outputs.sagemaker-role }}
         run: |
-          # Verify sagemaker is installed
-          python -c "from sagemaker.processing import Processor; print('SageMaker processing module OK')"
-          
-          # Get values from step outputs
-          PIPELINE_NAME="${{ steps.deploy.outputs.pipeline-name }}"
-          SAGEMAKER_BUCKET="${{ steps.deploy.outputs.sagemaker-bucket }}"
-          FETCHER_IMAGE="${{ steps.deploy.outputs.fetcher-image }}"
-          SAGEMAKER_ROLE="${{ steps.deploy.outputs.sagemaker-role }}"
-          
           echo "Creating SageMaker Pipeline..."
           echo "Pipeline: ${PIPELINE_NAME}"
           echo "Bucket: ${SAGEMAKER_BUCKET}"
@@ -205,20 +207,35 @@ jobs:
           
           if [ -z "$SAGEMAKER_ROLE" ]; then
             echo "ERROR: SageMaker role not found in CDK outputs"
+            echo "Fetching from CloudFormation directly..."
+            SAGEMAKER_ROLE=$(aws cloudformation describe-stacks --stack-name AHI-MLOps-Pipeline --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" --output text)
+            PIPELINE_NAME=$(aws cloudformation describe-stacks --stack-name AHI-MLOps-Pipeline --query "Stacks[0].Outputs[?OutputKey=='PipelineName'].OutputValue" --output text)
+            SAGEMAKER_BUCKET=$(aws cloudformation describe-stacks --stack-name AHI-MLOps-Pipeline --query "Stacks[0].Outputs[?OutputKey=='SageMakerBucketName'].OutputValue" --output text)
+            FETCHER_IMAGE=$(aws cloudformation describe-stacks --stack-name AHI-MLOps-Pipeline --query "Stacks[0].Outputs[?OutputKey=='FetcherImageUri'].OutputValue" --output text)
+            echo "From CloudFormation:"
+            echo "  Role: ${SAGEMAKER_ROLE}"
+            echo "  Pipeline: ${PIPELINE_NAME}"
+            echo "  Bucket: ${SAGEMAKER_BUCKET}"
+            echo "  Image: ${FETCHER_IMAGE}"
+          fi
+          
+          if [ -z "$SAGEMAKER_ROLE" ]; then
+            echo "ERROR: Still no SageMaker role found"
             exit 1
           fi
           
           python << EOF
+          import os
           from pipeline.pipeline_definition import get_pipeline
           
           pipeline = get_pipeline(
-              role='${SAGEMAKER_ROLE}',
-              pipeline_name='${PIPELINE_NAME}',
-              fetcher_image_uri='${FETCHER_IMAGE}',
-              default_bucket='${SAGEMAKER_BUCKET}',
+              role=os.environ['SAGEMAKER_ROLE'],
+              pipeline_name=os.environ['PIPELINE_NAME'],
+              fetcher_image_uri=os.environ['FETCHER_IMAGE'],
+              default_bucket=os.environ['SAGEMAKER_BUCKET'],
               region='${{ env.AWS_REGION }}',
           )
-          pipeline.upsert(role_arn='${SAGEMAKER_ROLE}')
+          pipeline.upsert(role_arn=os.environ['SAGEMAKER_ROLE'])
           print('SageMaker Pipeline created/updated successfully!')
           EOF
 
